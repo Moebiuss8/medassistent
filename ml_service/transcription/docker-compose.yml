@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  transcription:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      - HUGGING_FACE_TOKEN=${HUGGING_FACE_TOKEN}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - .:/app
+    restart: unless-stopped
