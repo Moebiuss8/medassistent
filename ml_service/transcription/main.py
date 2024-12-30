@@ -1,58 +1,49 @@
-import whisper
-import numpy as np
-import torch
-from fastapi import FastAPI, WebSocket
-from pydantic import BaseModel
-import asyncio
-import json
-from typing import Dict
-from datetime import datetime
+from fastapi import FastAPI, WebSocket, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import soundfile as sf
+from openai import OpenAI
+import asyncio
+import os
+from datetime import datetime
+from typing import Dict
 import io
 
 app = FastAPI()
+api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key)
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load Whisper model
-model = whisper.load_model("base")
-
-# Store active connections
 connections: Dict[str, WebSocket] = {}
 
-async def process_audio(audio_data: bytes, session_id: str):
+async def transcribe_audio(audio_data: bytes, session_id: str):
     try:
-        # Convert audio bytes to numpy array
-        audio_np, _ = sf.read(io.BytesIO(audio_data))
+        # Save audio chunk temporarily
+        temp_file = io.BytesIO(audio_data)
+        temp_file.name = "audio.wav"
         
-        # Ensure audio is mono
-        if len(audio_np.shape) > 1:
-            audio_np = np.mean(audio_np, axis=1)
+        # Transcribe using OpenAI Whisper API
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=temp_file,
+            response_format="text"
+        )
         
-        # Normalize audio
-        audio_np = audio_np / np.max(np.abs(audio_np))
-        
-        # Transcribe with Whisper
-        result = model.transcribe(audio_np)
-        
-        # Send transcription back to client
+        # Send transcription to client
         if session_id in connections:
             await connections[session_id].send_json({
                 "type": "transcript",
-                "text": result["text"],
+                "text": transcript,
                 "timestamp": datetime.now().isoformat()
             })
             
     except Exception as e:
-        print(f"Error processing audio: {e}")
+        print(f"Error transcribing audio: {e}")
         if session_id in connections:
             await connections[session_id].send_json({
                 "type": "error",
@@ -62,19 +53,13 @@ async def process_audio(audio_data: bytes, session_id: str):
 @app.websocket("/ws/transcribe")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    
-    # Generate unique session ID
     session_id = str(datetime.now().timestamp())
     connections[session_id] = websocket
     
     try:
         while True:
-            # Receive audio chunk
             audio_data = await websocket.receive_bytes()
-            
-            # Process audio asynchronously
-            asyncio.create_task(process_audio(audio_data, session_id))
-            
+            asyncio.create_task(transcribe_audio(audio_data, session_id))
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
