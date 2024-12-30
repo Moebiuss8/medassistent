@@ -1,98 +1,86 @@
-from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
-import whisper_timestamped
+import whisper
 import numpy as np
+import torch
+from fastapi import FastAPI, WebSocket
+from pydantic import BaseModel
+import asyncio
+import json
+from typing import Dict
 from datetime import datetime
+from fastapi.middleware.cors import CORSMiddleware
+import soundfile as sf
+import io
 
 app = FastAPI()
 
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # In production, replace with specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-whisper_model = whisper_timestamped.load_model("large-v3")
+# Load Whisper model
+model = whisper.load_model("base")
 
-class TranscriptionSegment(BaseModel):
-    start: float
-    end: float
-    text: str
-    confidence: float
+# Store active connections
+connections: Dict[str, WebSocket] = {}
 
-class TranscriptionResponse(BaseModel):
-    segments: List[TranscriptionSegment]
-    full_text: str
-    metadata: dict
-
-async def process_audio(audio_data: bytes) -> TranscriptionResponse:
+async def process_audio(audio_data: bytes, session_id: str):
     try:
-        audio_array = whisper_timestamped.load_audio(audio_data)
+        # Convert audio bytes to numpy array
+        audio_np, _ = sf.read(io.BytesIO(audio_data))
         
-        result = whisper_timestamped.transcribe(
-            whisper_model,
-            audio_array,
-            language="en",
-            vad=True,
-            compute_word_confidence=True,
-            beam_size=5
-        )
-
-        segments = [
-            TranscriptionSegment(
-                start=segment["start"],
-                end=segment["end"],
-                text=segment["text"],
-                confidence=segment["confidence"]
-            ) for segment in result["segments"]
-        ]
-
-        full_text = " ".join(segment.text for segment in segments)
-
-        return TranscriptionResponse(
-            segments=segments,
-            full_text=full_text.strip(),
-            metadata={
-                "model": "whisper-large-v3",
-                "timestamp": datetime.utcnow().isoformat(),
-                "audio_duration": result["duration"],
-                "language": result["language"]
-            }
-        )
-
+        # Ensure audio is mono
+        if len(audio_np.shape) > 1:
+            audio_np = np.mean(audio_np, axis=1)
+        
+        # Normalize audio
+        audio_np = audio_np / np.max(np.abs(audio_np))
+        
+        # Transcribe with Whisper
+        result = model.transcribe(audio_np)
+        
+        # Send transcription back to client
+        if session_id in connections:
+            await connections[session_id].send_json({
+                "type": "transcript",
+                "text": result["text"],
+                "timestamp": datetime.now().isoformat()
+            })
+            
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/transcribe", response_model=TranscriptionResponse)
-async def transcribe_audio(file: UploadFile = File(...)):
-    contents = await file.read()
-    return await process_audio(contents)
+        print(f"Error processing audio: {e}")
+        if session_id in connections:
+            await connections[session_id].send_json({
+                "type": "error",
+                "message": str(e)
+            })
 
 @app.websocket("/ws/transcribe")
-async def websocket_transcribe(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
-    buffer = []
-    buffer_duration = 0
-    MAX_BUFFER_DURATION = 30
+    # Generate unique session ID
+    session_id = str(datetime.now().timestamp())
+    connections[session_id] = websocket
     
     try:
         while True:
-            data = await websocket.receive_bytes()
-            buffer.append(data)
-            buffer_duration += len(data) / (16000 * 2)
+            # Receive audio chunk
+            audio_data = await websocket.receive_bytes()
             
-            if buffer_duration >= MAX_BUFFER_DURATION:
-                combined_audio = b"".join(buffer)
-                result = await process_audio(combined_audio)
-                await websocket.send_json(result.dict())
-                buffer = []
-                buffer_duration = 0
-                
+            # Process audio asynchronously
+            asyncio.create_task(process_audio(audio_data, session_id))
+            
     except Exception as e:
-        await websocket.close()
-        raise e
+        print(f"WebSocket error: {e}")
+    finally:
+        if session_id in connections:
+            del connections[session_id]
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
