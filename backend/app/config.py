@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "your-secret-key-here"  # Change in production
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8  # 8 days
     
+    # External services
+    TRANSCRIPTION_SERVICE_URL: str = "http://localhost:8001"
+    OPENAI_API_KEY: str
+    
     class Config:
         case_sensitive = True
         env_file = ".env"
